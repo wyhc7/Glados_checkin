@@ -80,7 +80,7 @@ class Summary:
         lines: list[str] = []
         for i, r in enumerate(self.results, 1):
             line = (
-                f"#{i} | P:{r.points} | 剩余:{r.days} | "
+                f"#{i} | 获{r.points}分 | 余{r.days} | "
                 f"总积分:{r.points_total} | {r.status} | {r.exchange}"
             )
             lines.append(line)
@@ -89,3 +89,18 @@ class Summary:
     @property
     def content(self) -> str:
         return "\n".join(self.format_lines())
+
+    @property
+    def push_content(self) -> str:
+        """生成多行推送内容，每条结果单独成段，含天数。"""
+        blocks: list[str] = []
+        for i, r in enumerate(self.results, 1):
+            emoji = "✅" if r.is_success else ("🔄" if r.is_repeat else "❌")
+            blocks.append(
+                f"{emoji} 账号{i}\n"
+                f"    状态：{r.status}\n"
+                f"    积分：+{r.points}，累计 {r.points_total}\n"
+                f"    剩余：{r.days}\n"
+                f"    兑换：{r.exchange}"
+            )
+        return "\n\n".join(blocks)

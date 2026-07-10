@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.api import APIClient
+from src.api import APIClient, _clean_api_message
 from src.constants import APIEndpoint, CheckinStatus
 from src.models import NetworkError, CheckinRejected
 
@@ -145,3 +145,31 @@ class TestAPIClientExchange:
 
         result = api.exchange("fake_cookie", "plan500", 500)
         assert "兑换失败" in result
+
+    def test_exchange_clean_floating_message(self) -> None:
+        """验证浮点精度尾数被清理。"""
+        api = APIClient("test.domain")
+        api._session = MagicMock()
+        api._session.post.return_value = _make_mock_response(
+            200, {
+                "code": -1,
+                "message": "Not enough points. Need 200, have 59.0000000000000000",
+            }
+        )
+
+        result = api.exchange("fake_cookie", "plan200", 200)
+        assert "59.000000" not in result
+        assert "have 59" in result.lower()
+
+
+class TestCleanApiMessage:
+    def test_removes_floating_tail(self) -> None:
+        assert _clean_api_message("have 59.0000000000000000") == "have 59"
+        assert _clean_api_message("100.0000") == "100"
+
+    def test_preserves_normal_floats(self) -> None:
+        assert _clean_api_message("12.5") == "12.5"
+        assert _clean_api_message("3.14") == "3.14"
+
+    def test_preserves_non_number_text(self) -> None:
+        assert _clean_api_message("兑换成功") == "兑换成功"

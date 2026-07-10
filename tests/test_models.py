@@ -80,7 +80,27 @@ class TestSummary:
         lines = s.format_lines()
         assert len(lines) == 1
         assert "glados.cloud" not in lines[0]  # 行中不含 domain 字段
-        assert "P:10" in lines[0]
+        assert "获10分" in lines[0]
+        assert "余30 天" in lines[0]
+
+    def test_push_content(self) -> None:
+        results = [
+            CheckinResult(1, "glados.cloud", status="签到成功", points="8",
+                          days="59 天", points_total="59 积分",
+                          exchange="兑换失败: 积分不足",
+                          code=CheckinStatus.SUCCESS),
+            CheckinResult(2, "glados.cloud", status="重复签到", points="0",
+                          days="60 天", points_total="60 积分",
+                          exchange="兑换失败: 积分不足",
+                          code=CheckinStatus.REPEAT),
+        ]
+        s = Summary(results=results)
+        content = s.push_content
+        assert "✅ 账号1" in content
+        assert "🔄 账号2" in content
+        assert "剩余：59 天" in content
+        assert "累计 59 积分" in content
+        assert "\n\n" in content  # 多段分隔
 
     def test_content(self) -> None:
         results = [

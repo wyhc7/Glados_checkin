@@ -116,7 +116,7 @@ def main() -> int:
             config.push_channel,
             config.push_token,
             summary.title,
-            summary.content,
+            summary.push_content,
         )
         if success:
             logger.info(f"{L.SUCCESS} 推送成功")

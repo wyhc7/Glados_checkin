@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -13,6 +14,12 @@ from urllib3.util.retry import Retry
 
 from .constants import APIEndpoint, CheckinStatus, L
 from .models import NetworkError, CheckinRejected
+
+
+# ── 工具 ──────────────────────────────────────────────────
+def _clean_api_message(msg: str) -> str:
+    """清理 API 返回消息中的浮点精度尾数，如 59.0000000000000000 → 59。"""
+    return re.sub(r'(\d+)\.0{4,}', r'\1', msg)
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +265,7 @@ class APIClient:
         )
         data = resp.json()
         code = data.get("code", -2)
-        message = data.get("message", "未知错误")
+        message = _clean_api_message(data.get("message", "未知错误"))
 
         if code == 0:
             self._log(L.SUCCESS, f"code={code} msg={message}")
