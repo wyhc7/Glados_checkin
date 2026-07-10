@@ -1,0 +1,68 @@
+name: GLaDOS Auto Checkin v2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "README.md"
+      - "imgs/**"
+      - "docs/**"
+      - ".env.example"
+  schedule:
+    # UTC 0:00 / 6:00 → 北京时间 8:00 / 14:00
+    - cron: "0 0,6 * * *"
+
+jobs:
+  checkin:
+    name: glados checkin
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      actions: write
+
+    strategy:
+      matrix:
+        python-version: ["3.13"]
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run checkin
+        run: python -m src.main
+        env:
+          GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+          GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+          GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+          GLADOS_PUSH_CHANNEL: ${{ secrets.GLADOS_PUSH_CHANNEL }}
+          GLADOS_PUSH_TOKEN: ${{ secrets.GLADOS_PUSH_TOKEN }}
+          GLADOS_DOMAINS: ${{ secrets.GLADOS_DOMAINS }}
+          GLADOS_RETRY_MAX: ${{ secrets.GLADOS_RETRY_MAX }}
+          GLADOS_RETRY_BACKOFF: ${{ secrets.GLADOS_RETRY_BACKOFF }}
+
+      - name: Keep alive
+        uses: liskin/gh-workflow-keepalive@v1
+
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 7
+          keep_minimum_runs: 7
+          delete_run_by_conclusion_pattern: success
