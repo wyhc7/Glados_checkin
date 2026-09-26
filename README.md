@@ -51,10 +51,10 @@ python -m src.main --local
 
 ## 获取 Cookie
 
-1. 登录 [GLaDOS](https://glados.cloud) 签到页面
-2. F12 → Network → 刷新
-3. 点击第一个请求 → Request Headers → Cookie
-4. 复制 `koa:sess=...; koa:sess.sig=...` 部分
+1. 登录 https://glados.cloud 后退出再登录一次（GLaDOS 自 2026-09 起更换会话 Cookie 前缀）
+2. F12 → Network → 刷新 → 任一请求 → Request Headers → Cookie
+3. 复制完整 Cookie，必须包含 gld:sess 与 gld:sess.sig：
+   koa:sess=...; koa:sess.sig=...; gld:sess=...; gld:sess.sig=...
 
 多账号：`cookie1&cookie2&cookie3`
 
