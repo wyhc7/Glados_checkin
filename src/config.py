@@ -6,7 +6,11 @@ import os
 import logging
 from typing import Final
 
-from .constants import EXCHANGE_PLAN_POINTS, L
+from .constants import (
+    DEFAULT_EXCHANGE_MIN_DAYS,
+    EXCHANGE_PLAN_POINTS,
+    L,
+)
 from .models import ConfigError
 
 logger = logging.getLogger(__name__)
@@ -27,6 +31,7 @@ _ENV_VERBOSE = "GLADOS_VERBOSE"
 _ENV_DOMAINS = "GLADOS_DOMAINS"              # 自定义域名，逗号分隔
 _ENV_RETRY_MAX = "GLADOS_RETRY_MAX"
 _ENV_RETRY_BACKOFF = "GLADOS_RETRY_BACKOFF"
+_ENV_EXCHANGE_MIN_DAYS = "GLADOS_EXCHANGE_MIN_DAYS"  # 剩余天数低于此值才兑换
 
 
 class Config:
@@ -69,6 +74,15 @@ class Config:
         self.exchange_plan: Final[str] = plan
         self.exchange_points: Final[int] = EXCHANGE_PLAN_POINTS[plan]
 
+        # 剩余天数低于此值才触发兑换（默认 7 天）
+        self.exchange_min_days: Final[int] = _parse_int(
+            os.environ.get(_ENV_EXCHANGE_MIN_DAYS, ""),
+            DEFAULT_EXCHANGE_MIN_DAYS,
+            _ENV_EXCHANGE_MIN_DAYS,
+            min_val=0,
+            max_val=365,
+        )
+
         # ── Verbose ──
         verbose_env = os.environ.get(_ENV_VERBOSE, "")
         self.verbose: Final[bool] = _parse_bool(
@@ -102,8 +116,8 @@ class Config:
         # ── 日志摘要 ──
         logger.info(
             f"{L.INFO} Cookies: {len(self.cookies_list)} 个 | "
-            f"域名: {self.domains} | 兑换计划: {self.exchange_plan}"
-            f"({self.exchange_points}分) | 重试: {self.retry_max}次"
+            f"域名: {self.domains} | 兑换: 剩余<{self.exchange_min_days}天时"
+            f"换最长天数 | 重试: {self.retry_max}次"
         )
         if self.push_channel:
             logger.info(

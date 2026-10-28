@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Final
 
 
 # ── 签到状态 ──────────────────────────────────────────────
@@ -24,6 +25,17 @@ EXCHANGE_PLAN_POINTS: dict[str, int] = {
     ExchangePlan.PLAN200.value: 200,
     ExchangePlan.PLAN500.value: 500,
 }
+
+#: 各计划兑换到的天数（与 /api/user/points 返回的 plans 字段一致）。
+#: 用于"积分够换多个计划时，选能换到的最长天数"。
+EXCHANGE_PLAN_DAYS: dict[str, int] = {
+    ExchangePlan.PLAN100.value: 10,
+    ExchangePlan.PLAN200.value: 30,
+    ExchangePlan.PLAN500.value: 100,
+}
+
+#: 剩余天数低于该值才触发兑换（默认 7 天）
+DEFAULT_EXCHANGE_MIN_DAYS: Final = 7
 
 
 # ── API 端点 ──────────────────────────────────────────────

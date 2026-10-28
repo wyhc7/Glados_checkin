@@ -50,6 +50,8 @@ class APIClient:
         self.retry_max = retry_max
         self.retry_backoff = retry_backoff
         self._session: requests.Session | None = None
+        #: 最近一次 get_status 拿到的剩余天数（None 表示未知）
+        self.left_days: int | None = None
 
     @property
     def session(self) -> requests.Session:
@@ -231,7 +233,10 @@ class APIClient:
         raise CheckinRejected(f"签到被拒绝 code={code} msg={message}")
 
     def get_status(self, cookie: str) -> tuple[str, int]:
-        """获取剩余天数。返回 (天数描述, code)。"""
+        """获取剩余天数。返回 (天数描述, code)。
+
+        同时把数值存进 ``self.left_days``，供兑换判断用（无需拆字符串）。
+        """
         self._log(L.STATUS, "查询剩余天数")
         resp = self._request(
             APIEndpoint.STATUS, method="GET", cookie=cookie
@@ -248,8 +253,10 @@ class APIClient:
 
         if left_days is not None:
             days_int = int(float(left_days))
+            self.left_days: int | None = days_int
             self._log(L.SUCCESS, f"code={code} leftDays={days_int}天")
             return f"{days_int} 天", code
+        self.left_days = None
         self._log(L.FAIL, f"code={code} leftDays=None", force=True)
         return "None 天", code
 

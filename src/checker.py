@@ -7,10 +7,32 @@ from typing import Any
 
 from .api import APIClient
 from .config import Config
-from .constants import CheckinStatus, L
+from .constants import EXCHANGE_PLAN_DAYS, EXCHANGE_PLAN_POINTS, CheckinStatus, L
 from .models import CheckinResult, Summary, GladosError
 
 logger = logging.getLogger(__name__)
+
+
+def pick_best_plan(points: int) -> tuple[str, int, int] | None:
+    """在积分能承受的范围内，选出兑到天数最多的计划。
+
+    规则是"只用一次兑换、换最长天数"，不追求把积分花光：
+        900 分 → plan500（100 天）
+        450 分 → plan200（30 天，plan500 换不起）
+        150 分 → plan100（10 天）
+        50  分 → None（啥也换不起）
+
+    返回 ``(plan, 消耗积分, 获得天数)``；一个都换不起时返回 None。
+    """
+    best: tuple[str, int, int] | None = None
+    for plan, need in EXCHANGE_PLAN_POINTS.items():
+        if points < need:
+            continue
+        days = EXCHANGE_PLAN_DAYS.get(plan, 0)
+        # 天数更多者优先；天数相同则消耗更少者优先
+        if best is None or days > best[2] or (days == best[2] and need < best[1]):
+            best = (plan, need, days)
+    return best
 
 
 class Checker:
@@ -121,33 +143,51 @@ class Checker:
                     )
 
                 # 4. 积分兑换
-                # 积分不足时不发请求，省一次 API 调用，也避免日志里天天"积分不足"
-                if points_num < self.config.exchange_points:
+                # 规则：只在快到期（剩余 < exchange_min_days）时才换，
+                # 且换"积分能承受的最长天数"，不做多次兑换。
+                left = api.left_days
+                if left is None:
+                    result.exchange = "跳过兑换（剩余天数未知）"
+                    logger.info(
+                        f"{L.COOKIE}[{cookie_idx}] {L.DOMAIN}[{domain}] "
+                        f"{L.EXCHANGE} {result.exchange}"
+                    )
+                elif left >= self.config.exchange_min_days:
                     result.exchange = (
-                        f"跳过兑换（{points_num}/{self.config.exchange_points} 分不足）"
+                        f"跳过兑换（余 {left} 天，"
+                        f"≥{self.config.exchange_min_days} 天不换）"
                     )
                     logger.info(
                         f"{L.COOKIE}[{cookie_idx}] {L.DOMAIN}[{domain}] "
                         f"{L.EXCHANGE} {result.exchange}"
                     )
                 else:
-                    logger.info(
-                        f"{L.COOKIE}[{cookie_idx}] {L.DOMAIN}[{domain}] "
-                        f"{L.EXCHANGE} 兑换 {self.config.exchange_plan}"
-                        f"（需 {self.config.exchange_points} 积分）"
-                    )
-                    try:
-                        result.exchange = api.exchange(
-                            cookie,
-                            self.config.exchange_plan,
-                            self.config.exchange_points,
+                    best = pick_best_plan(points_num)
+                    if best is None:
+                        cheapest = min(EXCHANGE_PLAN_POINTS.values())
+                        result.exchange = (
+                            f"无法兑换（余 {left} 天，"
+                            f"{points_num} 分不足最低 {cheapest} 分）"
                         )
-                    except GladosError as e:
                         logger.warning(
                             f"{L.COOKIE}[{cookie_idx}] {L.DOMAIN}[{domain}] "
-                            f"{L.WARNING} 兑换异常: {e}"
+                            f"{L.WARNING} {result.exchange}"
                         )
-                        result.exchange = f"兑换失败: {e}"
+                    else:
+                        plan, need, days = best
+                        logger.info(
+                            f"{L.COOKIE}[{cookie_idx}] {L.DOMAIN}[{domain}] "
+                            f"{L.EXCHANGE} 余 {left} 天，{points_num} 分 "
+                            f"→ 兑换 {plan}（{need} 分 / {days} 天）"
+                        )
+                        try:
+                            result.exchange = api.exchange(cookie, plan, need)
+                        except GladosError as e:
+                            logger.warning(
+                                f"{L.COOKIE}[{cookie_idx}] {L.DOMAIN}[{domain}] "
+                                f"{L.WARNING} 兑换异常: {e}"
+                            )
+                            result.exchange = f"兑换失败: {e}"
 
             except GladosError as e:
                 logger.error(
