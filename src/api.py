@@ -13,7 +13,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .constants import APIEndpoint, CheckinStatus, L
-from .models import NetworkError, CheckinRejected
+from .models import AuthError, NetworkError, CheckinRejected
 
 
 # ── 工具 ──────────────────────────────────────────────────
@@ -58,11 +58,13 @@ class APIClient:
             self._session = requests.Session()
 
             # urllib3 层重试（仅覆盖连接/读超时 + 特定状态码）
+            # 注意：只让 GET 自动重放。签到/兑换是 POST，被 urllib3 在 5xx 时
+            # 自动重试会造成重复提交；POST 的重试统一交给应用层显式控制。
             retry_strategy = Retry(
                 total=self.retry_max,
                 backoff_factor=self.retry_backoff / 3,  # urllib3 backoff 乘算
                 status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["GET", "POST"],
+                allowed_methods=["GET"],
                 raise_on_status=False,
             )
             adapter = HTTPAdapter(
@@ -122,13 +124,19 @@ class APIClient:
         method: str = "GET",
         cookie: str,
         body: dict[str, str] | None = None,
+        retry: bool = True,
     ) -> requests.Response:
-        """发送请求，应用层兜底重试。"""
+        """发送请求，应用层兜底重试。
+
+        ``retry=False`` 时只发一次（签到/兑换这类非幂等 POST 用），
+        避免 5xx 时重复提交。
+        """
         url = self._url(endpoint)
         session_headers = {"Cookie": cookie}
 
+        max_attempts = self.retry_max + 1 if retry else 1
         last_exc: Exception | None = None
-        for attempt in range(1, self.retry_max + 2):  # 1 次初始 + N 次重试
+        for attempt in range(1, max_attempts + 1):  # 1 次初始 + N 次重试
             try:
                 if method == "GET":
                     resp = self.session.get(
@@ -149,7 +157,7 @@ class APIClient:
                 # 5xx 视为瞬时故障，触发重试
                 if resp.status_code >= 500:
                     self._warn(f"{url} → {resp.status_code}（第{attempt}次尝试）")
-                    if attempt <= self.retry_max:
+                    if attempt < max_attempts:
                         sleep_s = self.retry_backoff * (2 ** (attempt - 1))
                         time.sleep(sleep_s)
                         continue
@@ -176,13 +184,13 @@ class APIClient:
                 last_exc = e
                 self._warn(f"{url} HTTP 错误（第{attempt}次尝试）")
 
-            if attempt <= self.retry_max:
+            if attempt < max_attempts:
                 sleep_s = self.retry_backoff * (2 ** (attempt - 1))
                 self._log(L.RETRY, f"将在 {sleep_s:.1f}s 后重试...", force=True)
                 time.sleep(sleep_s)
 
         raise NetworkError(
-            f"{url} 请求失败，已重试 {self.retry_max} 次"
+            f"{url} 请求失败，已重试 {max_attempts - 1} 次"
         ) from last_exc
 
     # ── 业务操作 ────────────────────────────────────────────
@@ -192,6 +200,7 @@ class APIClient:
         resp = self._request(
             APIEndpoint.CHECKIN, method="POST", cookie=cookie,
             body={"token": self.domain},
+            retry=False,  # 签到非幂等，重复提交会多记一次
         )
         data = resp.json()
         code = data.get("code", -2)
@@ -215,6 +224,10 @@ class APIClient:
                 "status": "重复签到",
             }
         # 其他 code → 抛出异常而非返回假成功
+        # code=-2 是 GLaDOS 的"没有权限"，本质是 Cookie 失效/被顶掉，
+        # 用 AuthError 区分出来，让上层能明确提示"请重抓 Cookie"。
+        if code == -2 or "权限" in message or "permission" in message.lower():
+            raise AuthError(f"Cookie 失效或无权访问 code={code} msg={message}")
         raise CheckinRejected(f"签到被拒绝 code={code} msg={message}")
 
     def get_status(self, cookie: str) -> tuple[str, int]:
@@ -226,6 +239,12 @@ class APIClient:
         data = resp.json()
         code = data.get("code", -2)
         left_days = data.get("data", {}).get("leftDays")
+
+        # Cookie 失效时接口一律回 code=-2，尽早抛 AuthError，避免白跑后面几步
+        if code == -2 and left_days is None:
+            raise AuthError(
+                f"Cookie 失效或无权访问 code={code} msg={data.get('message', '')}"
+            )
 
         if left_days is not None:
             days_int = int(float(left_days))
@@ -243,6 +262,11 @@ class APIClient:
         data = resp.json()
         code = data.get("code", -2)
         points = data.get("points")
+
+        if code == -2 and points is None:
+            raise AuthError(
+                f"Cookie 失效或无权访问 code={code} msg={data.get('message', '')}"
+            )
 
         if points is not None:
             points_int = int(float(points))
@@ -262,6 +286,7 @@ class APIClient:
             method="POST",
             cookie=cookie,
             body={"planType": plan},
+            retry=False,  # 兑换非幂等，重复提交会重复扣分
         )
         data = resp.json()
         code = data.get("code", -2)

@@ -111,32 +111,43 @@ class Checker:
                     f"{L.POINTS} 查询总积分"
                 )
                 try:
-                    points_str, _ = api.get_points(cookie)
+                    points_str, points_num = api.get_points(cookie)
                     result.points_total = points_str
                 except GladosError as e:
+                    points_num = 0
                     logger.warning(
                         f"{L.COOKIE}[{cookie_idx}] {L.DOMAIN}[{domain}] "
                         f"{L.WARNING} 查询积分失败: {e}"
                     )
 
                 # 4. 积分兑换
-                logger.info(
-                    f"{L.COOKIE}[{cookie_idx}] {L.DOMAIN}[{domain}] "
-                    f"{L.EXCHANGE} 兑换 {self.config.exchange_plan}"
-                    f"（需 {self.config.exchange_points} 积分）"
-                )
-                try:
-                    result.exchange = api.exchange(
-                        cookie,
-                        self.config.exchange_plan,
-                        self.config.exchange_points,
+                # 积分不足时不发请求，省一次 API 调用，也避免日志里天天"积分不足"
+                if points_num < self.config.exchange_points:
+                    result.exchange = (
+                        f"跳过兑换（{points_num}/{self.config.exchange_points} 分不足）"
                     )
-                except GladosError as e:
-                    logger.warning(
+                    logger.info(
                         f"{L.COOKIE}[{cookie_idx}] {L.DOMAIN}[{domain}] "
-                        f"{L.WARNING} 兑换异常: {e}"
+                        f"{L.EXCHANGE} {result.exchange}"
                     )
-                    result.exchange = f"兑换失败: {e}"
+                else:
+                    logger.info(
+                        f"{L.COOKIE}[{cookie_idx}] {L.DOMAIN}[{domain}] "
+                        f"{L.EXCHANGE} 兑换 {self.config.exchange_plan}"
+                        f"（需 {self.config.exchange_points} 积分）"
+                    )
+                    try:
+                        result.exchange = api.exchange(
+                            cookie,
+                            self.config.exchange_plan,
+                            self.config.exchange_points,
+                        )
+                    except GladosError as e:
+                        logger.warning(
+                            f"{L.COOKIE}[{cookie_idx}] {L.DOMAIN}[{domain}] "
+                            f"{L.WARNING} 兑换异常: {e}"
+                        )
+                        result.exchange = f"兑换失败: {e}"
 
             except GladosError as e:
                 logger.error(
