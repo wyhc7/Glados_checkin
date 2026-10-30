@@ -8,12 +8,24 @@ import pytest
 
 from src.cookie import (
     clean_cookie,
+    cookie_flavor,
     cookie_keys,
     mask_cookie,
     probe_domain,
     validate_cookie,
 )
 from src.models import AuthError, NetworkError
+
+
+class TestCookieFlavor:
+    def test_detects_gld(self) -> None:
+        assert cookie_flavor("gld:sess=abc; gld:sess.sig=def") == "gld"
+
+    def test_detects_koa(self) -> None:
+        assert cookie_flavor("koa:sess=abc; koa:sess.sig=def") == "koa"
+
+    def test_unknown(self) -> None:
+        assert cookie_flavor("foo=bar") is None
 
 
 class TestCleanCookie:
@@ -53,9 +65,20 @@ class TestValidateCookie:
     def test_complete_cookie_is_clean(self) -> None:
         assert validate_cookie("koa:sess=abc; koa:sess.sig=def") == []
 
+    def test_gld_complete_cookie_is_clean(self) -> None:
+        assert validate_cookie("gld:sess=abc; gld:sess.sig=def") == []
+
     def test_missing_sig_warns(self) -> None:
         warnings = validate_cookie("koa:sess=abc")
-        assert any("koa:sess.sig" in w for w in warnings)
+        assert any("sess.sig" in w for w in warnings)
+
+    def test_gld_missing_sig_warns(self) -> None:
+        warnings = validate_cookie("gld:sess=abc")
+        assert any("sess.sig" in w for w in warnings)
+
+    def test_mixed_flavors_warns(self) -> None:
+        warnings = validate_cookie("gld:sess=a; gld:sess.sig=b; koa:sess=c; koa:sess.sig=d")
+        assert any("两套字段名" in w for w in warnings)
 
     def test_empty_warns(self) -> None:
         assert validate_cookie("   ")

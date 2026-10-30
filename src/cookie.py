@@ -1,9 +1,16 @@
-"""Cookie 清洗与域名探测。
+"""Cookie 清洗、字段名校验与域名探测。
 
-GLaDOS 用 koa-session，``koa:sess`` + ``koa:sess.sig`` 必须成对出现；
-手动从浏览器复制时常见的三种污染——带 ``Cookie:`` 前缀、带引号、带换行——
-都会让服务端解析不出 session，一律回 ``code=-2 没有权限``。
-另外 session 跟域名绑定，写死一个域名很容易撞上 ``-2``，
+GLaDOS 换过后端，session 字段名跟着变了：
+
+  新版（2024 之后）: ``gld:sess`` + ``gld:sess.sig``
+  老版（koa-session）: ``koa:sess`` + ``koa:sess.sig``
+
+服务端只认自己那套，字段名对不上就等于匿名访问，一律回 ``code=-2 没有权限``
+——这跟 cookie 有没有过期、IP 有没有被封完全无关。
+手动从浏览器复制时另外三种常见污染——带 ``Cookie:`` 前缀、带引号、带换行——
+同样会让服务端解析不出 session。
+
+session 还跟域名绑定，写死一个域名容易撞 ``-2``，
 所以这里提供 ``probe_domain`` 先用最小代价把可用域名试出来。
 """
 
@@ -13,11 +20,12 @@ import logging
 import re
 from typing import Final
 
+from .constants import SESSION_KEYS, SESSION_SIG_KEYS
 from .models import AuthError
 
 logger = logging.getLogger(__name__)
 
-#: 默认探测顺序：glados.cloud 是国内最常用入口，其余为备选/历史域名。
+#: 默认探测顺序：国内最常用入口在前，其余为备选/历史域名。
 DEFAULT_PROBE_DOMAINS: Final[tuple[str, ...]] = (
     "glados.cloud",
     "glados.rocks",
@@ -36,10 +44,10 @@ def clean_cookie(raw: str) -> str:
     处理：
       1. 去掉 ``Cookie:`` 前缀、首尾引号、换行/回车/制表符；
       2. 去掉每段 key/value 内部的换行，并压掉多余空格；
-      3. 若缺少 ``koa:sess.sig``，保留原样（由 ``validate_cookie`` 报警）。
+      3. 不改 key 名、不做 URL decode（签名段含 ``-``/``_``，decode 会弄坏）。
 
-    >>> clean_cookie('Cookie: koa:sess=abc; koa:sess.sig=def')
-    'koa:sess=abc; koa:sess.sig=def'
+    >>> clean_cookie('Cookie: gld:sess=abc; gld:sess.sig=def')
+    'gld:sess=abc; gld:sess.sig=def'
     """
     s = raw.strip().strip('"').strip("'")
     s = s.replace("\r", "").replace("\n", "").replace("\t", "")
@@ -58,6 +66,15 @@ def cookie_keys(cookie: str) -> list[str]:
     return keys
 
 
+def cookie_flavor(cookie: str) -> str | None:
+    """判断这条 cookie 属于哪套字段名：``"gld"`` / ``"koa"`` / ``None``。"""
+    keys = set(cookie_keys(cookie))
+    for name in ("gld", "koa"):
+        if f"{name}:sess" in keys:
+            return name
+    return None
+
+
 def validate_cookie(cookie: str, label: str = "") -> list[str]:
     """自检 cookie 结构，返回人类可读的告警列表（不抛异常）。"""
     warnings: list[str] = []
@@ -67,15 +84,36 @@ def validate_cookie(cookie: str, label: str = "") -> list[str]:
         return warnings
 
     keys = cookie_keys(cookie)
-    if not any(k == "koa:sess" for k in keys):
-        warnings.append(f"{tag}缺少 'koa:sess'，当前 keys={keys}")
-    if not any(k == "koa:sess.sig" for k in keys):
+    has_sess = any(k in SESSION_KEYS for k in keys)
+    has_sig = any(k in SESSION_SIG_KEYS for k in keys)
+
+    if not has_sess:
         warnings.append(
-            f"{tag}缺少 'koa:sess.sig'（签名段），服务端会直接回 code=-2"
+            f"{tag}缺少 session 字段（需要 {' 或 '.join(SESSION_KEYS)}），"
+            f"当前 keys={keys}；服务端会当成匿名访问回 code=-2"
         )
-    if " " in cookie.split("=", 1)[-1]:
-        # value 中出现裸空格，多半是复制时吞进了换行残留
-        warnings.append(f"{tag}cookie 值含空格，可能已被截断")
+    if not has_sig:
+        warnings.append(
+            f"{tag}缺少签名段（需要 {' 或 '.join(SESSION_SIG_KEYS)}），"
+            f"服务端会直接回 code=-2"
+        )
+
+    # 两套混用：多半是复制错了，gld 后端不认 koa，反之亦然
+    flavors = {k.split(":")[0] for k in keys if k.endswith(":sess")}
+    if len(flavors) > 1:
+        warnings.append(
+            f"{tag}同时出现 {'/'.join(sorted(flavors))} 两套字段名，保留一套即可"
+        )
+
+    if not warnings:
+        sig_val = ""
+        for part in cookie.split(";"):
+            m = _KV_RE.match(part.strip())
+            if m and m.group(1) in SESSION_SIG_KEYS:
+                sig_val = m.group(2).strip()
+                break
+        if sig_val and (" " in sig_val or sig_val.endswith("=")):
+            warnings.append(f"{tag}签名段疑似被截断或含空格")
     return warnings
 
 
@@ -126,8 +164,15 @@ def probe_domain(
             return domain, code
         reasons.append(f"{domain}: code={code}")
 
+    flavor = cookie_flavor(cookie)
+    hint = (
+        f"当前字段名识别为 {flavor}:sess"
+        if flavor
+        else "未识别到任何 session 字段（需要 gld:sess 或 koa:sess）"
+    )
     raise AuthError(
         "Cookie 在所有域名下均无权限（code=-2）。"
-        "请在无痕窗口重新登录 GLaDOS 后重抓 koa:sess 与 koa:sess.sig。\n  "
+        f"{hint}。"
+        "请无痕窗口重新登录 GLaDOS，把 gld:sess 与 gld:sess.sig 两段都复制。\n  "
         + "\n  ".join(reasons)
     )

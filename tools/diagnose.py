@@ -25,7 +25,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.api import APIClient  # noqa: E402
 from src.constants import DEFAULT_DOMAINS  # noqa: E402
-from src.cookie import clean_cookie, mask_cookie, validate_cookie  # noqa: E402
+from src.cookie import (  # noqa: E402
+    clean_cookie,
+    cookie_flavor,
+    mask_cookie,
+    validate_cookie,
+)
 from src.models import NetworkError  # noqa: E402
 
 
@@ -63,7 +68,10 @@ def _load_cookies(args: argparse.Namespace) -> list[str]:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="GLaDOS 签到问题诊断")
-    p.add_argument("--cookie", help="单条 cookie（含 koa:sess 与 koa:sess.sig）")
+    p.add_argument(
+        "--cookie",
+        help="单条 cookie（gld:sess + gld:sess.sig，老版 koa:sess 也支持）",
+    )
     p.add_argument("--local", action="store_true", help="从 .env 读取配置")
     p.add_argument("--proxy", help="测试代理，如 http://127.0.0.1:7890")
     p.add_argument(
@@ -94,7 +102,7 @@ def main() -> int:
             for w in problems:
                 print(f"  ⚠️  {w}")
         else:
-            print("  ✅ 结构完整（koa:sess + koa:sess.sig）")
+            print(f"  ✅ 结构完整（{cookie_flavor(ck) or '?'}:sess + 签名段）")
 
         winner = None
         for domain in domains:
@@ -121,7 +129,7 @@ def main() -> int:
     print("=" * 60)
     print(f"结果: {ok_total}/{len(cookies)} 条 cookie 可用")
     if ok_total == 0:
-        print("结论: 先去无痕窗口重新登录 GLaDOS，抓 koa:sess + koa:sess.sig；")
+        print("结论: 先去无痕窗口重新登录 GLaDOS，复制 gld:sess + gld:sess.sig 两段；")
         print("      再确认出口 IP 不是机房段（可加 --proxy 对比）。")
         return 2
     print("结论: cookie 有效，直接用 `python -m src.main --local` 跑签到。")

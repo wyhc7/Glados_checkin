@@ -44,7 +44,15 @@ DEFAULT_DOMAINS: Final = (
     "glados.rocks",
     "glados.work",
     "glados.space",
+    "glados.la",
 )
+
+#: session 字段名。GLaDOS 换过后端：
+#:   新版（2024 后）：gld:sess / gld:sess.sig
+#:   老版（koa-session）：koa:sess / koa:sess.sig
+#: 服务端只认自己那套，字段名对不上 = 匿名访问 = code=-2。
+SESSION_KEYS: Final = ("gld:sess", "koa:sess")
+SESSION_SIG_KEYS: Final = ("gld:sess.sig", "koa:sess.sig")
 
 
 # ── API 端点 ──────────────────────────────────────────────
