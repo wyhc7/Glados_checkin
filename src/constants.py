@@ -37,6 +37,15 @@ EXCHANGE_PLAN_DAYS: dict[str, int] = {
 #: 剩余天数低于该值才触发兑换（默认 7 天）
 DEFAULT_EXCHANGE_MIN_DAYS: Final = 7
 
+#: 域名探测顺序：按国内可达性排列，命中一个即停止。
+#: 优先级来源：GitHub 上 Glados-Railgun-checkin / GLaDOS_Checkin_ql 的实践。
+DEFAULT_DOMAINS: Final = (
+    "glados.cloud",
+    "glados.rocks",
+    "glados.work",
+    "glados.space",
+)
+
 
 # ── API 端点 ──────────────────────────────────────────────
 class APIEndpoint(Enum):

@@ -127,8 +127,12 @@ def main() -> int:
 
     logger.info(f"{L.END} 签到完成")
 
-    # 如果有失败的，返回 1
-    return 0 if summary.fail_count == 0 else 1
+    # 退出码策略：
+    #   0 = 全部成功/重复
+    #   2 = 有失败（cookie 失效等），但流程本身跑完了
+    # 用 2 而不是 1，方便在 Actions 里按退出码区分"脚本崩了"和"cookie 死了"。
+    # 想恢复红灯硬失败，把下面改成 `return 0 if summary.fail_count == 0 else 1`。
+    return 0 if summary.fail_count == 0 else 2
 
 
 if __name__ == "__main__":

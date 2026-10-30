@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import os
 import logging
+import re
 from typing import Final
 
 from .constants import (
+    DEFAULT_DOMAINS,
     DEFAULT_EXCHANGE_MIN_DAYS,
     EXCHANGE_PLAN_POINTS,
     L,
 )
+from .cookie import clean_cookie, validate_cookie
 from .models import ConfigError
 
 logger = logging.getLogger(__name__)
@@ -18,9 +21,11 @@ logger = logging.getLogger(__name__)
 # ── 默认值 ────────────────────────────────────────────────
 DEFAULT_EXCHANGE_PLAN: Final = "plan500"
 DEFAULT_VERBOSE: Final = False
-DEFAULT_DOMAINS: Final = ("glados.cloud",)
 DEFAULT_RETRY_MAX: Final = 3
 DEFAULT_RETRY_BACKOFF: Final = 2.0  # 秒
+
+#: cookie 分隔符：`&` 为主（兼容旧配置），`|` 和换行也可以。
+_COOKIE_SPLIT_RE = re.compile(r"\s*(?:&|\||\r?\n)\s*")
 
 # 环境变量键名
 _ENV_PUSH_CHANNEL = "GLADOS_PUSH_CHANNEL"   # 推送渠道: telegram|bark|serverchan|pushplus|wecom|feishu
@@ -46,13 +51,19 @@ class Config:
                 "请在 GitHub Secrets 中配置 GLADOS_COOKIES。"
             )
         self.cookies_list: Final[list[str]] = [
-            c.strip() for c in raw.split("&") if c.strip()
+            clean_cookie(c)
+            for c in _COOKIE_SPLIT_RE.split(raw)
+            if c.strip()
         ]
         if not self.cookies_list:
             raise ConfigError(
                 f"环境变量 '{_ENV_COOKIES}' 已设置但未包含有效 Cookie。"
                 "格式: cookie1&cookie2&cookie3"
             )
+        # 结构自检：缺 koa:sess.sig 是 code=-2 的头号原因，提前吼出来
+        for idx, ck in enumerate(self.cookies_list, 1):
+            for w in validate_cookie(ck, label=f"Cookie{idx}"):
+                logger.warning(f"{L.WARNING} {w}")
 
         # ── 域名 ──
         domains_env = os.environ.get(_ENV_DOMAINS, "")
@@ -116,7 +127,7 @@ class Config:
         # ── 日志摘要 ──
         logger.info(
             f"{L.INFO} Cookies: {len(self.cookies_list)} 个 | "
-            f"域名: {self.domains} | 兑换: 剩余<{self.exchange_min_days}天时"
+            f"域名: {self.domains}（自动探测）| 兑换: 剩余<{self.exchange_min_days}天时"
             f"换最长天数 | 重试: {self.retry_max}次"
         )
         if self.push_channel:

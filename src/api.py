@@ -29,8 +29,18 @@ _READ_TIMEOUT = 30
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/128.0.0.0 Safari/537.36"
+    "Chrome/130.0.0.0 Safari/537.36"
 )
+
+#: 模拟浏览器请求头。GLaDOS 对缺 Referer/sec-ch-ua 的请求更容易回 code=-2，
+#: 尤其是从 GitHub Actions 这类机房 IP 发出来的时候。
+_BROWSER_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "sec-ch-ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
 
 
 class APIClient:
@@ -80,8 +90,10 @@ class APIClient:
             self._session.headers.update(
                 {
                     "Origin": f"https://{self.domain}",
+                    "Referer": f"https://{self.domain}/console/checkin",
                     "User-Agent": _USER_AGENT,
                     "Content-Type": "application/json; charset=utf-8",
+                    **_BROWSER_HEADERS,
                 }
             )
         return self._session
@@ -196,6 +208,21 @@ class APIClient:
         ) from last_exc
 
     # ── 业务操作 ────────────────────────────────────────────
+    def raw_status_code(self, cookie: str) -> int:
+        """只取 ``/api/user/status`` 的 ``code``，异常一律转成 -2。
+
+        域名探测专用：不发业务日志、不抛 AuthError，方便批量试域名。
+        """
+        try:
+            resp = self._request(
+                APIEndpoint.STATUS, method="GET", cookie=cookie, retry=False
+            )
+            return int(resp.json().get("code", -2))
+        except NetworkError:
+            raise
+        except Exception:
+            return -2
+
     def checkin(self, cookie: str) -> dict[str, Any]:
         """执行签到。返回 {'code':..., 'points':..., 'message':..., 'status':...}。"""
         self._log(L.CHECKIN, "执行签到")
@@ -245,7 +272,7 @@ class APIClient:
         code = data.get("code", -2)
         left_days = data.get("data", {}).get("leftDays")
 
-        # Cookie 失效时接口一律回 code=-2，尽早抛 AuthError，避免白跑后面几步
+        # 结构探测：-2 且没有数据 → 不是"还没签到"，而是 session 不被承认
         if code == -2 and left_days is None:
             raise AuthError(
                 f"Cookie 失效或无权访问 code={code} msg={data.get('message', '')}"

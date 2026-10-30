@@ -10,8 +10,14 @@ on:
       - "docs/**"
       - ".env.example"
   schedule:
-    # UTC 0:00 / 6:00 → 北京时间 8:00 / 14:00
-    - cron: "0 0,6 * * *"
+    # UTC 1:17 / 7:17 → 北京时间 9:17 / 15:17
+    # 避开整点：GitHub 机房整点出口最挤，GLaDOS 更容易回 code=-2
+    - cron: "17 1,7 * * *"
+
+# 同一时刻只允许一个签到任务，避免两个 workflow 用同一 cookie 并发（会话互顶）
+concurrency:
+  group: glados-checkin
+  cancel-in-progress: false
 
 jobs:
   checkin:
@@ -44,6 +50,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run checkin
+        id: checkin
         run: python -m src.main
         env:
           GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
@@ -54,6 +61,17 @@ jobs:
           GLADOS_DOMAINS: ${{ secrets.GLADOS_DOMAINS }}
           GLADOS_RETRY_MAX: ${{ secrets.GLADOS_RETRY_MAX }}
           GLADOS_RETRY_BACKOFF: ${{ secrets.GLADOS_RETRY_BACKOFF }}
+          # 可选：自建/住宅代理，机房 IP 被风控时填上（空值会被 requests 忽略）
+          HTTPS_PROXY: ${{ secrets.GLADOS_PROXY }}
+          HTTP_PROXY: ${{ secrets.GLADOS_PROXY }}
+        # 退出码 2 = 签到失败（多半是 cookie 失效），不算工作流崩溃：
+        # 保留日志与推送，但不要让整个 job 标红。
+        continue-on-error: true
+
+      - name: Fail on script error
+        # 只把真正的脚本异常（退出码 1）当失败
+        if: steps.checkin.outcome == 'failure'
+        run: exit 1
 
       - name: Keep alive
         uses: liskin/gh-workflow-keepalive@v1

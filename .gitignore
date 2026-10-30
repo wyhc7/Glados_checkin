@@ -18,9 +18,14 @@ Thumbs.db
 
 # pytest
 .pytest_cache/
+.pytest_tmp/
 htmlcov/
 .coverage
 
 # venv
 venv/
 .venv/
+
+# 本地临时目录（pip / 试跑）
+wt/
+tmppip/
