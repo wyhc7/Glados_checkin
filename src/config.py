@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import logging
 import re
@@ -50,20 +51,20 @@ class Config:
                 f"环境变量 '{_ENV_COOKIES}' 未设置或为空。"
                 "请在 GitHub Secrets 中配置 GLADOS_COOKIES。"
             )
-        self.cookies_list: Final[list[str]] = [
-            clean_cookie(c)
-            for c in _COOKIE_SPLIT_RE.split(raw)
-            if c.strip()
-        ]
+        #: 与 cookies_list 一一对应；JSON 格式下可携带每个账号的 UA / origin
+        self.accounts: Final[list[dict[str, str]]] = _parse_accounts(raw)
+        self.cookies_list: Final[list[str]] = [a["cookie"] for a in self.accounts]
         if not self.cookies_list:
             raise ConfigError(
                 f"环境变量 '{_ENV_COOKIES}' 已设置但未包含有效 Cookie。"
-                "格式: cookie1&cookie2&cookie3"
+                "格式: JSON 数组，或 cookie1&cookie2"
             )
-        # 结构自检：缺 koa:sess.sig 是 code=-2 的头号原因，提前吼出来
+        # 结构自检：缺签名段是 code=-2 的头号原因，提前吼出来
         for idx, ck in enumerate(self.cookies_list, 1):
             for w in validate_cookie(ck, label=f"Cookie{idx}"):
                 logger.warning(f"{L.WARNING} {w}")
+        if any(a.get("user_agent") for a in self.accounts):
+            logger.info(f"{L.INFO} 已为部分账号配置自定义 User-Agent")
 
         # ── 域名 ──
         domains_env = os.environ.get(_ENV_DOMAINS, "")
@@ -139,6 +140,61 @@ class Config:
 
 
 # ── 工具函数 ──────────────────────────────────────────────
+def _parse_accounts(raw: str) -> list[dict[str, str]]:
+    """解析 GLADOS_COOKIES，返回 [{cookie, user_agent, origin}, ...]。
+
+    两种格式都支持：
+      1. **JSON 数组（推荐）**：可给每个账号单独指定 UA 与域名
+         ``[{"cookie": "gld:sess=...", "user-agent": "...", "origin": "glados.cloud"}]``
+      2. 旧式 ``&`` / ``|`` / 换行分隔：只给 cookie 本身
+    """
+    text = raw.lstrip("\ufeff").strip()
+    if text.startswith(("[", "{")):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ConfigError(
+                f"'{_ENV_COOKIES}' 看起来是 JSON 但解析失败: {e}"
+            ) from e
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            raise ConfigError(f"'{_ENV_COOKIES}' 必须是 JSON 数组: [{{...}}]")
+
+        accounts: list[dict[str, str]] = []
+        for pos, item in enumerate(data, 1):
+            if not isinstance(item, dict):
+                raise ConfigError(f"'{_ENV_COOKIES}' 第 {pos} 项必须是对象")
+            cookie = clean_cookie(str(item.get("cookie") or ""))
+            if not cookie:
+                raise ConfigError(f"'{_ENV_COOKIES}' 第 {pos} 项缺少 cookie")
+            accounts.append(
+                {
+                    "cookie": cookie,
+                    "user_agent": " ".join(
+                        str(item.get("user-agent") or item.get("user_agent") or "").split()
+                    ),
+                    "origin": str(item.get("origin") or "").strip(),
+                }
+            )
+        # 去重：同一 Cookie 只跑一次，避免重复签到
+        seen: set[str] = set()
+        unique: list[dict[str, str]] = []
+        for a in accounts:
+            if a["cookie"] in seen:
+                logger.warning(f"{L.WARNING} 检测到重复 Cookie，已跳过")
+                continue
+            seen.add(a["cookie"])
+            unique.append(a)
+        return unique
+
+    return [
+        {"cookie": clean_cookie(c), "user_agent": "", "origin": ""}
+        for c in _COOKIE_SPLIT_RE.split(text)
+        if c.strip()
+    ]
+
+
 def _parse_bool(raw: str, default: bool, env_key: str) -> bool:
     """解析布尔型环境变量。"""
     if not raw:

@@ -135,6 +135,7 @@ def probe_domain(
     domains: tuple[str, ...] = DEFAULT_PROBE_DOMAINS,
     *,
     verbose: bool = False,
+    user_agent: str = "",
 ) -> tuple[str, int]:
     """依次探测域名，返回 (可用域名, status_code)。
 
@@ -149,7 +150,9 @@ def probe_domain(
     reasons: list[str] = []
     for domain in domains:
         try:
-            with APIClient(domain=domain) as api:
+            with APIClient(
+                domain=domain, user_agent=user_agent, retry_max=1
+            ) as api:
                 code = api.raw_status_code(cookie)
         except NetworkError as e:
             reasons.append(f"{domain}: 网络错误 {e}")

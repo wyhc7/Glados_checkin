@@ -8,6 +8,7 @@ requests 这种"塑料 Chrome"只有 1 分。装不上 curl_cffi 时自动退回
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -19,7 +20,14 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .constants import APIEndpoint, CheckinStatus, L
+from .constants import (
+    APIEndpoint,
+    CHALLENGE_DELAY_SECONDS,
+    CHALLENGE_SUFFIX,
+    PLATFORM_UA,
+    CheckinStatus,
+    L,
+)
 from .models import AuthError, NetworkError, CheckinRejected
 
 #: curl_cffi 可选依赖：有则用（TLS 指纹更像真浏览器），无则退回 requests
@@ -43,11 +51,23 @@ logger = logging.getLogger(__name__)
 # curl_cffi 首连（含 TLS 握手）比 requests 慢，15s 容易在探测阶段误超时。
 _CONNECT_TIMEOUT = 30
 _READ_TIMEOUT = 30
-_USER_AGENT = (
+_DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/130.0.0.0 Safari/537.36"
 )
+
+
+def _user_agent() -> str:
+    """User-Agent：优先用 GLADOS_USER_AGENT，否则用默认值。
+
+    GLaDOS 会校验 UA 与登录设备是否一致（code=4 / device-mismatch），
+    所以最好填成抓 cookie 那个浏览器的 UA。
+    """
+    return os.environ.get("GLADOS_USER_AGENT", "").strip() or _DEFAULT_UA
+
+
+_USER_AGENT = _DEFAULT_UA
 
 #: 模拟浏览器请求头。GLaDOS 对缺 Referer/sec-ch-ua 的请求更容易回 code=-2，
 #: 尤其是从 GitHub Actions 这类机房 IP 发出来的时候。
@@ -80,16 +100,24 @@ class APIClient:
         verbose: bool = False,
         retry_max: int = 3,
         retry_backoff: float = 2.0,
+        user_agent: str = "",
     ) -> None:
         self.domain = domain
         self.cookie_index = cookie_index
         self.verbose = verbose
         self.retry_max = retry_max
         self.retry_backoff = retry_backoff
+        #: 该账号专属 UA（抓 cookie 时的浏览器）；空则用 GLADOS_USER_AGENT 或默认值
+        self.user_agent = (user_agent or "").strip()
         self._session: requests.Session | None = None
         self._cffi_session: Any | None = None
         #: 最近一次 get_status 拿到的剩余天数（None 表示未知）
         self.left_days: int | None = None
+
+    @property
+    def ua(self) -> str:
+        """本会话生效的 User-Agent。"""
+        return self.user_agent or _user_agent()
 
     @property
     def uses_tls_impersonation(self) -> bool:
@@ -124,7 +152,7 @@ class APIClient:
                 {
                     "Origin": f"https://{self.domain}",
                     "Referer": f"https://{self.domain}/console/checkin",
-                    "User-Agent": _USER_AGENT,
+                    "User-Agent": self.ua,
                     "Content-Type": "application/json; charset=utf-8",
                     **_BROWSER_HEADERS,
                 }
@@ -140,7 +168,7 @@ class APIClient:
                 {
                     "Origin": f"https://{self.domain}",
                     "Referer": f"https://{self.domain}/console/checkin",
-                    "User-Agent": _USER_AGENT,
+                    "User-Agent": self.ua,
                     "Content-Type": "application/json; charset=utf-8",
                     **_BROWSER_HEADERS,
                 }
@@ -312,29 +340,145 @@ class APIClient:
         except Exception:
             return -2
 
+    # ── 签到 challenge ──────────────────────────────────────
+    def _fetch_challenge(self, cookie: str) -> tuple[str, str] | None:
+        """取签到 challenge，返回 (nonce, proof)；取不到返回 None。
+
+        2026-11 起 GLaDOS 在签到前要求这一步：先拿 nonce，等几秒，
+        再提交 ``sha256(f"{nonce}.glados-observe-v1")`` 作为 proof。
+        跳过它直接按旧协议 POST，会被判为自动化、只给 1 积分。
+        """
+        try:
+            resp = self._request(
+                APIEndpoint.CHECKIN_CHALLENGE, method="GET", cookie=cookie, retry=True
+            )
+            data = resp.json()
+        except Exception as e:  # noqa: BLE001 - 取不到就回退旧协议
+            self._warn(f"签到 challenge 获取失败，回退旧协议（可能只拿 1 分）: {e}")
+            return None
+
+        if not isinstance(data, dict) or data.get("code") != 0:
+            self._warn(f"签到 challenge 响应异常，回退旧协议: {data}")
+            return None
+
+        nonce = data.get("nonce")
+        if not nonce:
+            self._warn("签到 challenge 缺少 nonce，回退旧协议")
+            return None
+
+        # 服务端要求拿到 nonce 后等一会儿再提交，立刻提交视为无效
+        time.sleep(CHALLENGE_DELAY_SECONDS)
+        proof = hashlib.sha256(
+            f"{nonce}.{CHALLENGE_SUFFIX}".encode()
+        ).hexdigest()
+        self._log(L.INFO, "已获取签到 challenge")
+        return str(nonce), proof
+
+    def _post_checkin(
+        self, cookie: str, payload: dict[str, Any], *, as_json: bool
+    ) -> dict[str, Any]:
+        """发签到 POST。challenge 流程要发 JSON，旧协议发表单。"""
+        url = self._url(APIEndpoint.CHECKIN)
+        headers = {
+            "Cookie": cookie,
+            "Referer": f"https://{self.domain}/console/checkin",
+            "Origin": f"https://{self.domain}",
+        }
+        if as_json:
+            headers["Content-Type"] = "application/json; charset=utf-8"
+            raw = json.dumps(payload)
+        else:
+            raw = "&".join(f"{k}={v}" for k, v in payload.items())
+
+        if _HAS_CFFI:
+            resp = self.cffi_session.post(
+                url,
+                headers=headers,
+                data=raw,
+                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+            )
+        else:
+            resp = self.session.post(
+                url,
+                headers=headers,
+                data=raw,
+                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+            )
+        resp.raise_for_status()
+        return resp.json()
+
+    @staticmethod
+    def _earned_points(data: dict[str, Any]) -> str:
+        """本次签到所得积分。
+
+        顶层 ``points`` 是账户总积分而非本次所得；本次得分在
+        ``list[0].change`` 里。取不到时退回顶层值。
+        """
+        records = data.get("list")
+        if isinstance(records, list) and records and isinstance(records[0], dict):
+            change = records[0].get("change")
+            if change is not None:
+                return str(change)
+        return str(data.get("points", 0))
+
     def checkin(self, cookie: str) -> dict[str, Any]:
-        """执行签到。返回 {'code':..., 'points':..., 'message':..., 'status':...}。"""
+        """执行签到。返回 {'code':..., 'points':..., 'message':..., 'status':...}。
+
+        优先走 challenge 流程（正常给十几分）；
+        challenge 拿不到时回退旧协议（通常只给 1 分，会打告警）。
+        遇到 ``code=4 / device-mismatch`` 时按 ``loginDevice`` 换 UA 重试一次。
+        """
         self._log(L.CHECKIN, "执行签到")
-        resp = self._request(
-            APIEndpoint.CHECKIN, method="POST", cookie=cookie,
-            body={"token": self.domain},
-            retry=False,  # 签到非幂等，重复提交会多记一次
-        )
-        data = resp.json()
+
+        challenge = self._fetch_challenge(cookie)
+        if challenge:
+            nonce, proof = challenge
+            payload: dict[str, Any] = {
+                "token": self.domain,
+                "nonce": nonce,
+                "proof": proof,
+            }
+        else:
+            payload = {"token": self.domain}
+
+        data = self._post_checkin(cookie, payload, as_json=bool(challenge))
+
+        # 设备不匹配：服务端会告诉我们登录设备是什么平台，据此换 UA 再来一次
+        if (
+            isinstance(data, dict)
+            and data.get("code") == 4
+            and data.get("reason") == "device-mismatch"
+        ):
+            device = str(data.get("loginDevice") or "")
+            retry_ua = PLATFORM_UA.get(device)
+            if retry_ua:
+                self._warn(f"设备平台不匹配（loginDevice={device}），按该平台 UA 重试")
+                saved_ua = _USER_AGENT
+                try:
+                    self._override_ua(retry_ua)
+                    data = self._post_checkin(
+                        cookie, payload, as_json=bool(challenge)
+                    )
+                finally:
+                    self._override_ua(saved_ua)
+            else:
+                self._warn(
+                    f"设备平台不匹配（loginDevice={device}，不在已知列表），"
+                    "可设 GLADOS_USER_AGENT 为抓 cookie 那个浏览器的 UA"
+                )
+
         code = data.get("code", -2)
         message = data.get("message", "")
-        points = str(data.get("points", 0))
+        points = self._earned_points(data) if code == 0 else "0"
 
         if code == CheckinStatus.SUCCESS.value:
             self._log(L.SUCCESS, f"code={code} points={points} msg={message}")
-            # 1 分是 GLaDOS 对"疑似自动化"的降权值：真浏览器通常十几分。
-            # 不报错，只提醒——省得你以后以为脚本一直正常。
+            # 1 分 = 大概率没走 challenge 或被降权，明确告警
             try:
                 if float(points) <= 1:
                     self._warn(
-                        f"仅获 {points} 分，疑似被识别为自动化而降权"
-                        f"（TLS 伪装={'开' if _HAS_CFFI else '关'}，"
-                        f"建议换代理 IP 或改用浏览器方案）"
+                        f"仅获 {points} 分，疑似被降权"
+                        f"（challenge={'已用' if challenge else '未取得'}）"
                     )
             except (TypeError, ValueError):
                 pass
@@ -358,6 +502,15 @@ class APIClient:
         if code == -2 or "权限" in message or "permission" in message.lower():
             raise AuthError(f"Cookie 失效或无权访问 code={code} msg={message}")
         raise CheckinRejected(f"签到被拒绝 code={code} msg={message}")
+
+    def _override_ua(self, ua: str) -> None:
+        """临时替换会话的 User-Agent（设备重试用）。"""
+        for sess in (self._session, self._cffi_session):
+            if sess is not None:
+                try:
+                    sess.headers["User-Agent"] = ua
+                except Exception:  # noqa: BLE001
+                    pass
 
     def get_status(self, cookie: str) -> tuple[str, int]:
         """获取剩余天数。返回 (天数描述, code)。

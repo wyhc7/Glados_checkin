@@ -63,17 +63,31 @@ class Checker:
         )
 
         task_idx = 0
-        for cookie_idx, cookie in enumerate(cookies, 1):
+        accounts = getattr(self.config, "accounts", None) or [
+            {"cookie": c, "user_agent": "", "origin": ""} for c in cookies
+        ]
+        for cookie_idx, account in enumerate(accounts, 1):
+            cookie = account["cookie"]
+            #: 该账号抓 cookie 时的浏览器 UA，用于绕过设备校验
+            user_agent = account.get("user_agent", "") or ""
+            #: 该账号实际登录的域名，优先尝试
+            origin = account.get("origin", "") or ""
             logger.info(
                 f"{L.START} {'=' * 10} Cookie {cookie_idx}/{cookie_count} {'=' * 10}"
             )
 
             # ── 阶段一：定位这条 cookie 认得哪个域名 ──
+            probe_order = tuple(
+                [origin] + [d for d in self.config.domains if d != origin]
+                if origin
+                else self.config.domains
+            )
             try:
                 domain, _ = probe_domain(
                     cookie,
-                    tuple(self.config.domains),
+                    probe_order,
                     verbose=self.config.verbose,
+                    user_agent=user_agent,
                 )
             except AuthError as e:
                 # 所有域名都 -2：cookie 已死，只记一条失败，不再逐域名刷屏
@@ -100,7 +114,7 @@ class Checker:
                 f"{L.INFO} --- 任务 {task_idx}/{total}: "
                 f"{L.COOKIE}[{cookie_idx}] @ {L.DOMAIN}[{domain}] ---"
             )
-            result = self._process_one(cookie, cookie_idx, domain)
+            result = self._process_one(cookie, cookie_idx, domain, user_agent)
             self.results.append(result)
 
             if result.is_success or result.is_repeat:
@@ -124,6 +138,7 @@ class Checker:
         cookie: str,
         cookie_idx: int,
         domain: str,
+        user_agent: str = "",
     ) -> CheckinResult:
         """处理单个 cookie+domain 的完整签到流程。"""
         result = CheckinResult(cookie_index=cookie_idx, domain=domain)
@@ -135,6 +150,7 @@ class Checker:
             verbose=self.config.verbose,
             retry_max=self.config.retry_max,
             retry_backoff=self.config.retry_backoff,
+            user_agent=user_agent,
         ) as api:
             try:
                 # 1. 查询剩余天数（失败不阻断裂后续：有些账号 status 受限但能签到）
