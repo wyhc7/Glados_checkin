@@ -61,7 +61,9 @@ jobs:
           GLADOS_DOMAINS: ${{ secrets.GLADOS_DOMAINS }}
           GLADOS_RETRY_MAX: ${{ secrets.GLADOS_RETRY_MAX }}
           GLADOS_RETRY_BACKOFF: ${{ secrets.GLADOS_RETRY_BACKOFF }}
-          # 可选：自建/住宅代理，机房 IP 被风控时填上（空值会被 requests 忽略）
+          # 可选：TLS 指纹伪装目标，默认 chrome124
+          GLADOS_IMPERSONATE: ${{ secrets.GLADOS_IMPERSONATE }}
+          # 可选：自建/住宅代理，机房 IP 被风控时填上
           HTTPS_PROXY: ${{ secrets.GLADOS_PROXY }}
           HTTP_PROXY: ${{ secrets.GLADOS_PROXY }}
         # 退出码 2 = 签到失败（多半是 cookie 失效），不算工作流崩溃：

@@ -149,6 +149,9 @@ class Checker:
                     result.days = "None 天"
 
                 # 2. 签到
+                # 先访问一次控制台页面，建立"先看页面再点签到"的访问序列，
+                # 降低被判定为纯 API 自动化的概率（失败不阻断）。
+                api.prewarm(cookie)
                 logger.info(f"{tag} {L.CHECKIN} 执行签到")
                 try:
                     checkin_resp = api.checkin(cookie)

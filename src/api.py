@@ -1,9 +1,16 @@
-"""HTTP API 客户端：重试、超时、结构化日志。"""
+"""HTTP API 客户端：重试、超时、结构化日志。
+
+请求层优先用 ``curl_cffi``（伪造 Chrome 的 TLS/JA3 指纹）。
+GLaDOS 会按客户端指纹给不同奖励：真浏览器签到拿十几分，
+requests 这种"塑料 Chrome"只有 1 分。装不上 curl_cffi 时自动退回 requests，
+功能不受影响，只是可能被降权到 1 分。
+"""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from typing import Any
@@ -15,6 +22,15 @@ from urllib3.util.retry import Retry
 from .constants import APIEndpoint, CheckinStatus, L
 from .models import AuthError, NetworkError, CheckinRejected
 
+#: curl_cffi 可选依赖：有则用（TLS 指纹更像真浏览器），无则退回 requests
+try:
+    from curl_cffi import requests as cffi_requests
+
+    _HAS_CFFI = True
+except Exception:  # pragma: no cover - 环境相关
+    cffi_requests = None  # type: ignore[assignment]
+    _HAS_CFFI = False
+
 
 # ── 工具 ──────────────────────────────────────────────────
 def _clean_api_message(msg: str) -> str:
@@ -24,7 +40,8 @@ def _clean_api_message(msg: str) -> str:
 logger = logging.getLogger(__name__)
 
 # ── HTTP 配置 ──────────────────────────────────────────────
-_CONNECT_TIMEOUT = 15
+# curl_cffi 首连（含 TLS 握手）比 requests 慢，15s 容易在探测阶段误超时。
+_CONNECT_TIMEOUT = 30
 _READ_TIMEOUT = 30
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -40,7 +57,17 @@ _BROWSER_HEADERS = {
     "sec-ch-ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
 }
+
+#: curl_cffi 的指纹别名。可用 GLADOS_IMPERSONATE 覆盖（如 chrome124/chrome131）。
+_DEFAULT_IMPERSONATE = "chrome124"
+
+
+def _impersonate_target() -> str:
+    return os.environ.get("GLADOS_IMPERSONATE", "").strip() or _DEFAULT_IMPERSONATE
 
 
 class APIClient:
@@ -60,8 +87,14 @@ class APIClient:
         self.retry_max = retry_max
         self.retry_backoff = retry_backoff
         self._session: requests.Session | None = None
+        self._cffi_session: Any | None = None
         #: 最近一次 get_status 拿到的剩余天数（None 表示未知）
         self.left_days: int | None = None
+
+    @property
+    def uses_tls_impersonation(self) -> bool:
+        """是否启用了 curl_cffi 的 TLS 指纹伪装。"""
+        return _HAS_CFFI
 
     @property
     def session(self) -> requests.Session:
@@ -98,14 +131,44 @@ class APIClient:
             )
         return self._session
 
-    def close(self) -> None:
-        if self._session is not None:
+    @property
+    def cffi_session(self) -> Any:
+        """curl_cffi 会话：带 Chrome TLS 指纹，优先于 requests 使用。"""
+        if self._cffi_session is None:
+            self._cffi_session = cffi_requests.Session(impersonate=_impersonate_target())
+            self._cffi_session.headers.update(
+                {
+                    "Origin": f"https://{self.domain}",
+                    "Referer": f"https://{self.domain}/console/checkin",
+                    "User-Agent": _USER_AGENT,
+                    "Content-Type": "application/json; charset=utf-8",
+                    **_BROWSER_HEADERS,
+                }
+            )
+        return self._cffi_session
+
+    def prewarm(self, cookie: str) -> None:
+        """模拟真人的访问序列：首页 → 控制台 → 签到页。
+
+        GLaDOS 对"直接打 API、从没访问过任何页面"的会话更容易判自动化，
+        而且要拿到页面下发的 cookie/埋点。失败不阻断主流程。
+        """
+        for path in ("/", "/console", "/console/checkin"):
             try:
-                self._session.close()
-            except Exception:
-                pass
-            finally:
-                self._session = None
+                self._request_page(f"https://{self.domain}{path}", cookie)
+                time.sleep(1.2)  # 别让三个请求挤在同一毫秒
+            except Exception:  # noqa: BLE001 - 预热失败不阻断
+                continue
+
+    def close(self) -> None:
+        for sess in (self._session, self._cffi_session):
+            if sess is not None:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+        self._session = None
+        self._cffi_session = None
 
     def __enter__(self) -> APIClient:
         return self
@@ -131,6 +194,42 @@ class APIClient:
     def _url(self, endpoint: APIEndpoint) -> str:
         return f"https://{self.domain}{endpoint.value}"
 
+    def _send(
+        self,
+        url: str,
+        *,
+        method: str,
+        headers: dict[str, str],
+        body: dict[str, str] | None = None,
+    ) -> Any:
+        """发一次请求：优先 curl_cffi（真 TLS 指纹），失败或未安装则退回 requests。"""
+        payload = json.dumps(body) if body else None
+        timeout = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
+
+        if _HAS_CFFI:
+            if method == "GET":
+                return self.cffi_session.get(url, headers=headers, timeout=timeout)
+            return self.cffi_session.post(
+                url, headers=headers, data=payload, timeout=timeout
+            )
+
+        if method == "GET":
+            return self.session.get(url, headers=headers, timeout=timeout)
+        return self.session.post(
+            url, headers=headers, data=payload, timeout=timeout
+        )
+
+    def _request_page(self, url: str, cookie: str) -> None:
+        """访问一个 HTML 页面（预热用），忽略响应体。"""
+        headers = {
+            "Cookie": cookie,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+        }
+        self._send(url, method="GET", headers=headers)
+
     def _request(
         self,
         endpoint: APIEndpoint,
@@ -139,7 +238,7 @@ class APIClient:
         cookie: str,
         body: dict[str, str] | None = None,
         retry: bool = True,
-    ) -> requests.Response:
+    ) -> Any:
         """发送请求，应用层兜底重试。
 
         ``retry=False`` 时只发一次（签到/兑换这类非幂等 POST 用），
@@ -152,21 +251,9 @@ class APIClient:
         last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):  # 1 次初始 + N 次重试
             try:
-                if method == "GET":
-                    resp = self.session.get(
-                        url,
-                        headers=session_headers,
-                        timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
-                    )
-                elif method == "POST":
-                    resp = self.session.post(
-                        url,
-                        headers=session_headers,
-                        data=json.dumps(body) if body else None,
-                        timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
-                    )
-                else:
-                    raise ValueError(f"不支持的 HTTP 方法: {method}")
+                resp = self._send(
+                    url, method=method, headers=session_headers, body=body
+                )
 
                 # 5xx 视为瞬时故障，触发重试
                 if resp.status_code >= 500:
@@ -179,24 +266,26 @@ class APIClient:
                 resp.raise_for_status()
                 return resp
 
-            except requests.exceptions.Timeout as e:
+            except Exception as e:  # 统一按异常类型分流，兼容两套库
                 last_exc = e
-                self._warn(f"{url} 超时（第{attempt}次尝试）")
-            except requests.exceptions.ConnectionError as e:
-                last_exc = e
-                self._warn(f"{url} 连接失败（第{attempt}次尝试）")
-            except requests.exceptions.HTTPError as e:
-                # 4xx（非 429）不重试，直接抛出
-                if (
-                    e.response is not None
-                    and 400 <= e.response.status_code < 500
-                    and e.response.status_code != 429
-                ):
-                    raise NetworkError(
-                        f"{url} HTTP {e.response.status_code}: {e.response.text[:500]}"
-                    ) from e
-                last_exc = e
-                self._warn(f"{url} HTTP 错误（第{attempt}次尝试）")
+                name = type(e).__name__
+                is_timeout = "Timeout" in name
+                is_conn = "Connection" in name
+                is_http = "HTTPError" in name and getattr(e, "response", None) is not None
+
+                if is_timeout:
+                    self._warn(f"{url} 超时（第{attempt}次尝试）")
+                elif is_conn:
+                    self._warn(f"{url} 连接失败（第{attempt}次尝试）")
+                elif is_http:
+                    status = e.response.status_code
+                    # 4xx（非 429）不重试，直接抛出
+                    if 400 <= status < 500 and status != 429:
+                        text = e.response.text[:500]
+                        raise NetworkError(f"{url} HTTP {status}: {text}") from e
+                    self._warn(f"{url} HTTP 错误（第{attempt}次尝试）")
+                else:
+                    self._warn(f"{url} 请求异常: {name}: {e}")
 
             if attempt < max_attempts:
                 sleep_s = self.retry_backoff * (2 ** (attempt - 1))
@@ -238,6 +327,17 @@ class APIClient:
 
         if code == CheckinStatus.SUCCESS.value:
             self._log(L.SUCCESS, f"code={code} points={points} msg={message}")
+            # 1 分是 GLaDOS 对"疑似自动化"的降权值：真浏览器通常十几分。
+            # 不报错，只提醒——省得你以后以为脚本一直正常。
+            try:
+                if float(points) <= 1:
+                    self._warn(
+                        f"仅获 {points} 分，疑似被识别为自动化而降权"
+                        f"（TLS 伪装={'开' if _HAS_CFFI else '关'}，"
+                        f"建议换代理 IP 或改用浏览器方案）"
+                    )
+            except (TypeError, ValueError):
+                pass
             return {
                 "code": CheckinStatus.SUCCESS,
                 "points": points,

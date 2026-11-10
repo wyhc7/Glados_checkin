@@ -1,3 +1,6 @@
 requests>=2.31.0
 urllib3>=2.2.0
+# TLS 指纹伪装：让签到请求的 JA3 与真 Chrome 一致，
+# 否则 GLaDOS 会把脚本判定为自动化、只给 1 分。缺失时自动退回 requests。
+curl_cffi>=0.7.0
 python-dotenv>=1.0.0;  # 本地测试用，GitHub Actions 不需要
