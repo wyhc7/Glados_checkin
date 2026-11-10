@@ -48,13 +48,22 @@ def _clean_api_message(msg: str) -> str:
 logger = logging.getLogger(__name__)
 
 # ── HTTP 配置 ──────────────────────────────────────────────
-# curl_cffi 首连（含 TLS 握手）比 requests 慢，15s 容易在探测阶段误超时。
+# 国内到 glados 的握手偶发较慢，实测 6s 左右，30s 给足余量。
 _CONNECT_TIMEOUT = 30
 _READ_TIMEOUT = 30
+#: 域名探测用短超时：多个候选域名逐个试，长超时会叠加成几分钟。
+_PROBE_TIMEOUT = (8, 12)
+#: 默认 UA 与默认 sec-ch-ua 必须严格配套，否则服务端一眼看穿。
+#: 这里对齐真实抓包（Edge 157 / Chromium 157 / Windows），
+#: 需要换浏览器时同时改这两处，或用 GLADOS_USER_AGENT 整体覆盖。
 _DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/130.0.0.0 Safari/537.36"
+    "Chrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0"
+)
+
+_DEFAULT_SEC_CH_UA = (
+    '"Not-A.Brand";v="99", "Microsoft Edge";v="157", "Chromium";v="157"'
 )
 
 
@@ -67,19 +76,23 @@ def _user_agent() -> str:
     return os.environ.get("GLADOS_USER_AGENT", "").strip() or _DEFAULT_UA
 
 
+def _sec_ch_ua() -> str:
+    """sec-ch-ua 客户端提示头，需与 UA 平台/版本一致。"""
+    return os.environ.get("GLADOS_SEC_CH_UA", "").strip() or _DEFAULT_SEC_CH_UA
+
+
 _USER_AGENT = _DEFAULT_UA
 
-#: 模拟浏览器请求头。GLaDOS 对缺 Referer/sec-ch-ua 的请求更容易回 code=-2，
-#: 尤其是从 GitHub Actions 这类机房 IP 发出来的时候。
+#: 模拟浏览器请求头，取值对齐真实抓包。
 _BROWSER_HEADERS = {
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "zh-CN,zh;q=0.9",
-    "sec-ch-ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
     "sec-fetch-dest": "empty",
     "sec-fetch-mode": "cors",
     "sec-fetch-site": "same-origin",
+    "priority": "u=1, i",
 }
 
 #: curl_cffi 的指纹别名。可用 GLADOS_IMPERSONATE 覆盖（如 chrome124/chrome131）。
@@ -109,6 +122,8 @@ class APIClient:
         self.retry_backoff = retry_backoff
         #: 该账号专属 UA（抓 cookie 时的浏览器）；空则用 GLADOS_USER_AGENT 或默认值
         self.user_agent = (user_agent or "").strip()
+        #: 探测模式：使用更短超时，避免多域名叠加成几分钟
+        self._probing = False
         self._session: requests.Session | None = None
         self._cffi_session: Any | None = None
         #: 最近一次 get_status 拿到的剩余天数（None 表示未知）
@@ -155,6 +170,7 @@ class APIClient:
                     "User-Agent": self.ua,
                     "Content-Type": "application/json; charset=utf-8",
                     **_BROWSER_HEADERS,
+                    "sec-ch-ua": _sec_ch_ua(),
                 }
             )
         return self._session
@@ -171,6 +187,7 @@ class APIClient:
                     "User-Agent": self.ua,
                     "Content-Type": "application/json; charset=utf-8",
                     **_BROWSER_HEADERS,
+                    "sec-ch-ua": _sec_ch_ua(),
                 }
             )
         return self._cffi_session
@@ -230,16 +247,36 @@ class APIClient:
         headers: dict[str, str],
         body: dict[str, str] | None = None,
     ) -> Any:
-        """发一次请求：优先 curl_cffi（真 TLS 指纹），失败或未安装则退回 requests。"""
-        payload = json.dumps(body) if body else None
-        timeout = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
+        """发一次请求。
 
-        if _HAS_CFFI:
-            if method == "GET":
-                return self.cffi_session.get(url, headers=headers, timeout=timeout)
-            return self.cffi_session.post(
-                url, headers=headers, data=payload, timeout=timeout
-            )
+        默认走 requests（普通 TLS）：curl_cffi 伪造的 TLS 指纹在国内部分网络
+        会被直接阻断（curl 28 超时），可靠性优先。
+        需要伪装指纹时设 ``GLADOS_TLS_IMPERSONATE=1`` 改用 curl_cffi，
+        且失败会自动回退 requests。
+        """
+        payload = json.dumps(body) if body else None
+        timeout = (
+            _PROBE_TIMEOUT
+            if self._probing
+            else (_CONNECT_TIMEOUT, _READ_TIMEOUT)
+        )
+        use_cffi = _HAS_CFFI and os.environ.get(
+            "GLADOS_TLS_IMPERSONATE", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+        if use_cffi:
+            try:
+                if method == "GET":
+                    return self.cffi_session.get(
+                        url, headers=headers, timeout=timeout
+                    )
+                return self.cffi_session.post(
+                    url, headers=headers, data=payload, timeout=timeout
+                )
+            except Exception as e:  # noqa: BLE001 - TLS 被阻断时回退
+                if not getattr(self, "_cffi_broken", False):
+                    self._cffi_broken = True
+                    self._warn(f"curl_cffi 请求失败，回退 requests: {type(e).__name__}")
 
         if method == "GET":
             return self.session.get(url, headers=headers, timeout=timeout)
@@ -354,16 +391,25 @@ class APIClient:
             )
             data = resp.json()
         except Exception as e:  # noqa: BLE001 - 取不到就回退旧协议
-            self._warn(f"签到 challenge 获取失败，回退旧协议（可能只拿 1 分）: {e}")
+            logger.warning(
+                f"{L.COOKIE}[{self.cookie_index}] {L.DOMAIN}[{self.domain}] "
+                f"{L.WARNING} 签到 challenge 获取失败，回退旧协议（可能只拿 1 分）: {e}"
+            )
             return None
 
         if not isinstance(data, dict) or data.get("code") != 0:
-            self._warn(f"签到 challenge 响应异常，回退旧协议: {data}")
+            logger.warning(
+                f"{L.COOKIE}[{self.cookie_index}] {L.DOMAIN}[{self.domain}] "
+                f"{L.WARNING} 签到 challenge 响应异常，回退旧协议: {data}"
+            )
             return None
 
         nonce = data.get("nonce")
         if not nonce:
-            self._warn("签到 challenge 缺少 nonce，回退旧协议")
+            logger.warning(
+                f"{L.COOKIE}[{self.cookie_index}] {L.DOMAIN}[{self.domain}] "
+                f"{L.WARNING} 签到 challenge 缺少 nonce，回退旧协议"
+            )
             return None
 
         # 服务端要求拿到 nonce 后等一会儿再提交，立刻提交视为无效
@@ -371,13 +417,20 @@ class APIClient:
         proof = hashlib.sha256(
             f"{nonce}.{CHALLENGE_SUFFIX}".encode()
         ).hexdigest()
-        self._log(L.INFO, "已获取签到 challenge")
+        # 这是判断"能否拿满积分"的关键一步，必须无条件可见
+        logger.info(
+            f"{L.COOKIE}[{self.cookie_index}] {L.DOMAIN}[{self.domain}] "
+            f"{L.INFO} 已获取签到 challenge（nonce={str(nonce)[:8]}…）"
+        )
         return str(nonce), proof
 
     def _post_checkin(
         self, cookie: str, payload: dict[str, Any], *, as_json: bool
     ) -> dict[str, Any]:
-        """发签到 POST。challenge 流程要发 JSON，旧协议发表单。"""
+        """发签到 POST。challenge 流程要发 JSON，旧协议发表单。
+
+        非幂等：只发一次，不做任何自动重试。
+        """
         url = self._url(APIEndpoint.CHECKIN)
         headers = {
             "Cookie": cookie,
@@ -390,20 +443,22 @@ class APIClient:
         else:
             raw = "&".join(f"{k}={v}" for k, v in payload.items())
 
-        if _HAS_CFFI:
-            resp = self.cffi_session.post(
-                url,
-                headers=headers,
-                data=raw,
-                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
-            )
-        else:
-            resp = self.session.post(
-                url,
-                headers=headers,
-                data=raw,
-                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
-            )
+        timeout = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
+        use_cffi = _HAS_CFFI and os.environ.get(
+            "GLADOS_TLS_IMPERSONATE", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+        if use_cffi:
+            try:
+                resp = self.cffi_session.post(
+                    url, headers=headers, data=raw, timeout=timeout
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:  # noqa: BLE001 - TLS 被阻断时回退
+                self._warn(f"curl_cffi 签到失败，回退 requests: {type(e).__name__}")
+
+        resp = self.session.post(url, headers=headers, data=raw, timeout=timeout)
         resp.raise_for_status()
         return resp.json()
 
@@ -518,9 +573,15 @@ class APIClient:
         同时把数值存进 ``self.left_days``，供兑换判断用（无需拆字符串）。
         """
         self._log(L.STATUS, "查询剩余天数")
-        resp = self._request(
-            APIEndpoint.STATUS, method="GET", cookie=cookie
-        )
+        # status 只用于展示，偶发读超时很常见；只重试 1 次，
+        # 避免 3 次 × 30s 把整轮拖上两分钟。
+        saved_retry, self.retry_max = self.retry_max, min(self.retry_max, 1)
+        try:
+            resp = self._request(
+                APIEndpoint.STATUS, method="GET", cookie=cookie
+            )
+        finally:
+            self.retry_max = saved_retry
         data = resp.json()
         code = data.get("code", -2)
         left_days = data.get("data", {}).get("leftDays")

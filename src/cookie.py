@@ -148,16 +148,21 @@ def probe_domain(
     from .models import NetworkError
 
     reasons: list[str] = []
+    network_errors = 0
     for domain in domains:
         try:
             with APIClient(
                 domain=domain, user_agent=user_agent, retry_max=1
             ) as api:
+                # 探测阶段用短超时快速筛域名，但网络抖动不该被判成 cookie 失效
+                api._probing = True
                 code = api.raw_status_code(cookie)
         except NetworkError as e:
+            network_errors += 1
             reasons.append(f"{domain}: 网络错误 {e}")
             continue
         except Exception as e:  # noqa: BLE001 - 探测阶段吞掉一切，只要结果
+            network_errors += 1
             reasons.append(f"{domain}: {type(e).__name__} {e}")
             continue
 
@@ -166,6 +171,13 @@ def probe_domain(
         if code == 0:
             return domain, code
         reasons.append(f"{domain}: code={code}")
+
+    # 全部是网络问题 → 不是 cookie 失效，别误导成"请重抓 Cookie"
+    if network_errors == len(domains):
+        raise NetworkError(
+            "所有候选域名均无法建立连接（网络/服务端故障，非 Cookie 问题），"
+            "请稍后重试。\n  " + "\n  ".join(reasons)
+        )
 
     flavor = cookie_flavor(cookie)
     hint = (

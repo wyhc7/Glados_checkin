@@ -13,6 +13,7 @@ from .models import (
     AuthError,
     CheckinResult,
     GladosError,
+    NetworkError,
     Summary,
 )
 
@@ -89,6 +90,17 @@ class Checker:
                     verbose=self.config.verbose,
                     user_agent=user_agent,
                 )
+            except NetworkError as e:
+                # 纯粹连不上：不是 cookie 问题，提示稍后重跑，别让人白换 cookie
+                task_idx += 1
+                logger.error(
+                    f"{L.COOKIE}[{cookie_idx}] {L.ERROR} 网络故障，无法完成探测: {e}"
+                )
+                r = CheckinResult(cookie_index=cookie_idx, domain="未探测")
+                r.status = "网络故障: 所有候选域名均无法连接，请稍后重跑"
+                r.code = CheckinStatus.FAILURE
+                self.results.append(r)
+                continue
             except AuthError as e:
                 # 所有域名都 -2：cookie 已死，只记一条失败，不再逐域名刷屏
                 domain = self.config.domains[0]

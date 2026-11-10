@@ -76,19 +76,28 @@ CHALLENGE_DELAY_SECONDS: Final = 2.5
 
 # ── 设备校验 ──────────────────────────────────────────────
 #: 签到返回 code=4 且 reason=device-mismatch 时，按 loginDevice 换 UA 重试。
-#: 版本号无关紧要，平台 token（Windows/iPhone/Android…）才是关键。
+#: 版本号无关紧要，平台 token（Windows/iPhone/Android…）与浏览器品牌才是关键。
+_EDGE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0"
+)
+
 PLATFORM_UA: dict[str, str] = {
-    "Windows": (
+    "Windows": _EDGE_UA,
+    # 服务端可能直接回浏览器品牌而非平台名，两种都映射上
+    "Edge": _EDGE_UA,
+    "Edg": _EDGE_UA,
+    "Chrome": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
     ),
     "macOS": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
     ),
     "Linux": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
     ),
     "iPhone": (
         "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
@@ -102,7 +111,7 @@ PLATFORM_UA: dict[str, str] = {
     ),
     "Android": (
         "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        "(KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36"
     ),
 }
 
